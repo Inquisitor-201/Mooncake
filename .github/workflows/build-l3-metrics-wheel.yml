@@ -1,0 +1,16 @@
+name: Build L3 metrics validation wheel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-cuda13-cp312:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      architecture: x86_64
+      python-versions: '["3.12"]'
+      artifact-prefix: mooncake-l3-metrics-cuda13
+      version-override: 0.3.13.post1+l3metrics20261013
