@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1.7
+
+# Build a CUDA 13 wheel from this Mooncake revision, then install it into the
+# production HyperX image.  The second stage intentionally keeps the
+# production runtime, SGLang, NCCL, and store boot environment unchanged.
+ARG CUDA_VERSION=13.0.0
+ARG UBUNTU_VERSION=22.04
+ARG PYTHON_VERSION=3.12
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHON_VERSION=${PYTHON_VERSION} \
+    PATH="/usr/local/go/bin:${PATH}"
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        ninja-build \
+        software-properties-common \
+        pkg-config && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python${PYTHON_VERSION} 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+    apt-get purge -y --auto-remove software-properties-common && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY . /workspace
+
+RUN bash dependencies.sh -y
+
+RUN mkdir -p build && \
+    cd build && \
+    cmake -G Ninja .. \
+        -DBUILD_UNIT_TESTS=OFF \
+        -DUSE_HTTP=ON \
+        -DUSE_ETCD=ON \
+        -DUSE_CUDA=ON \
+        -DUSE_INTRA_NVLINK=ON \
+        -DWITH_EP=ON \
+        -DSTORE_USE_ETCD=ON \
+        -DWITH_STORE_RUST=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} && \
+    export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-} && \
+    cmake --build . -j"$(nproc)" && \
+    cd /workspace && \
+    mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
+    cd mooncake-transfer-engine/nvlink-allocator && \
+    bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
+    cd /workspace && \
+    CU13_BUILD=1 PYTHON_VERSION=${PYTHON_VERSION} OUTPUT_DIR=dist ./scripts/build_wheel.sh
+
+FROM hub.docker.alibaba-inc.com/aone-base/hyperx-worker:20261006103856_accelerated
+
+USER admin
+
+COPY --from=builder /workspace/mooncake-wheel/dist/*.whl /tmp/mooncake-wheel/
+
+RUN set -eux; \
+    /home/admin/sgl/bin/uv pip uninstall --python /home/admin/sgl/bin/python \
+        mooncake-transfer-engine mooncake-transfer-engine-cuda13 || true; \
+    /home/admin/sgl/bin/uv pip install --python /home/admin/sgl/bin/python \
+        --reinstall /tmp/mooncake-wheel/*.whl; \
+    rm -rf /tmp/mooncake-wheel
+
