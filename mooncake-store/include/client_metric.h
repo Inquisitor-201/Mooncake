@@ -493,6 +493,89 @@ struct TransferOperationMetric {
     }
 };
 
+// Physical cache probe/read-path metrics. These are intentionally keyed by
+// bounded tier names; they describe store-side lookup and read outcomes, not
+// token-level end-to-end hit rate.
+struct CacheProbeMetric {
+    std::array<std::string, 1> tier_names = {"tier"};
+
+    explicit CacheProbeMetric(std::map<std::string, std::string> labels = {})
+        : batch_is_exist_items(
+              "mooncake_client_batch_is_exist_items_total",
+              "Number of items probed by BatchIsExist", labels),
+          batch_is_exist_hits(
+              "mooncake_client_batch_is_exist_hits_total",
+              "Number of BatchIsExist items reported present by metadata",
+              labels),
+          batch_is_exist_misses(
+              "mooncake_client_batch_is_exist_misses_total",
+              "Number of BatchIsExist items reported absent by metadata", labels),
+          batch_is_exist_errors(
+              "mooncake_client_batch_is_exist_errors_total",
+              "Number of BatchIsExist items returning an error", labels),
+          batch_is_exist_latency_us(
+              "mooncake_client_batch_is_exist_latency_us",
+              "BatchIsExist latency in microseconds", kLatencyBucket, labels),
+          read_attempts_by_tier(
+              "mooncake_client_read_attempts_total",
+              "Number of read attempts by selected replica tier", labels,
+              tier_names),
+          read_successes_by_tier(
+              "mooncake_client_read_successes_total",
+              "Number of successful reads by selected replica tier", labels,
+              tier_names),
+          read_errors_by_tier(
+              "mooncake_client_read_errors_total",
+              "Number of failed reads by selected replica tier", labels,
+              tier_names),
+          read_bytes_by_tier(
+              "mooncake_client_read_bytes_total",
+              "Number of bytes read by selected replica tier", labels,
+              tier_names) {}
+
+    void ObserveBatchIsExist(size_t items, size_t hits, size_t misses,
+                             size_t errors, uint64_t latency_us) {
+        batch_is_exist_items.inc(items);
+        batch_is_exist_hits.inc(hits);
+        batch_is_exist_misses.inc(misses);
+        batch_is_exist_errors.inc(errors);
+        batch_is_exist_latency_us.observe(latency_us);
+    }
+
+    void ObserveRead(const std::string& tier, bool success, uint64_t bytes) {
+        const std::array<std::string, 1> label = {tier};
+        read_attempts_by_tier.inc(label);
+        if (success) {
+            read_successes_by_tier.inc(label);
+            read_bytes_by_tier.inc(label, bytes);
+        } else {
+            read_errors_by_tier.inc(label);
+        }
+    }
+
+    void serialize(std::string& str) {
+        batch_is_exist_items.serialize(str);
+        batch_is_exist_hits.serialize(str);
+        batch_is_exist_misses.serialize(str);
+        batch_is_exist_errors.serialize(str);
+        batch_is_exist_latency_us.serialize(str);
+        read_attempts_by_tier.serialize(str);
+        read_successes_by_tier.serialize(str);
+        read_errors_by_tier.serialize(str);
+        read_bytes_by_tier.serialize(str);
+    }
+
+    ylt::metric::counter_t batch_is_exist_items;
+    ylt::metric::counter_t batch_is_exist_hits;
+    ylt::metric::counter_t batch_is_exist_misses;
+    ylt::metric::counter_t batch_is_exist_errors;
+    ylt::metric::histogram_t batch_is_exist_latency_us;
+    ylt::metric::hybrid_counter_1t read_attempts_by_tier;
+    ylt::metric::hybrid_counter_1t read_successes_by_tier;
+    ylt::metric::hybrid_counter_1t read_errors_by_tier;
+    ylt::metric::hybrid_counter_1t read_bytes_by_tier;
+};
+
 // SSD latency bucket: microseconds, tuned for SSD/network storage
 // Range: 50us (high-end NVMe) to 30s (3fs/nfs large object batch writes)
 inline const std::vector<double> kSsdLatencyBucket = {
@@ -657,6 +740,7 @@ struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
+    CacheProbeMetric cache_probe_metric;
     SsdMetric ssd_metric;
 
     /**
@@ -678,6 +762,16 @@ struct ClientMetric {
                                   const std::string& op_name, uint64_t bytes,
                                   uint64_t latency_us) {
         transfer_operation_metric.Observe(kind, op_name, bytes, latency_us);
+    }
+
+    void ObserveBatchIsExist(size_t items, size_t hits, size_t misses,
+                             size_t errors, uint64_t latency_us) {
+        cache_probe_metric.ObserveBatchIsExist(items, hits, misses, errors,
+                                               latency_us);
+    }
+
+    void ObserveRead(const std::string& tier, bool success, uint64_t bytes) {
+        cache_probe_metric.ObserveRead(tier, success, bytes);
     }
 
     void serialize(std::string& str);

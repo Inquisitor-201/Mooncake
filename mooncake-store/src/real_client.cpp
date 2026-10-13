@@ -441,6 +441,15 @@ inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
     return false;
 }
 
+inline const char *ReadPathLabel(const Replica::Descriptor &replica) {
+    if (replica.is_memory_replica()) return "memory";
+    if (replica.is_nof_replica()) return "nof";
+    if (replica.is_local_disk_replica()) return "local_disk";
+    if (replica.is_dfs_replica()) return "dfs";
+    if (replica.is_disk_replica()) return "disk";
+    return "unknown";
+}
+
 }  // namespace
 
 PyClient::~PyClient() {}
@@ -2829,10 +2838,12 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
+            client_->ObserveRead("query_miss", false, 0);
             return nullptr;
         }
         LOG(ERROR) << "Query failed for key: " << key
                    << " with error: " << toString(query_result.error());
+        client_->ObserveRead("query_error", false, 0);
         return nullptr;
     }
 
@@ -2840,6 +2851,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         query_result.value().replicas;
     if (replica_list.empty()) {
         LOG(ERROR) << "Empty replica list for key: " << key;
+        client_->ObserveRead("no_replica", false, 0);
         return nullptr;
     }
 
@@ -2851,6 +2863,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
+        client_->ObserveRead("no_readable_replica", false, 0);
         return nullptr;
     }
 
@@ -2858,6 +2871,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     uint64_t total_length = calculate_total_size(replica);
 
     if (total_length == 0) {
+        client_->ObserveRead("zero_length", false, 0);
         return nullptr;
     }
 
@@ -2865,11 +2879,13 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     auto alloc_result = client_buffer_allocator->allocate(total_length);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
+        client_->ObserveRead("buffer_allocation", false, 0);
         return nullptr;
     }
 
     auto buffer_handle =
         std::make_shared<BufferHandle>(std::move(*alloc_result));
+    const char *tier = ReadPathLabel(replica);
 
     if (best_replica->is_local_disk_replica()) {
         // LOCAL_DISK: data is on remote node's SSD. Use offload RPC.
@@ -2883,6 +2899,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         if (!read_result) {
             LOG(ERROR) << "SSD read failed for key '" << key
                        << "': " << toString(read_result.error());
+            client_->ObserveRead(tier, false, 0);
             return nullptr;
         }
         auto checksum_result =
@@ -2891,8 +2908,10 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         if (!checksum_result) {
             LOG(ERROR) << "SSD checksum verification failed for key '" << key
                        << "': " << toString(checksum_result.error());
+            client_->ObserveRead(tier, false, 0);
             return nullptr;
         }
+        client_->ObserveRead(tier, true, total_length);
         return buffer_handle;
     }
 
@@ -2917,9 +2936,11 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
+        client_->ObserveRead(tier, false, 0);
         return nullptr;
     }
 
+    client_->ObserveRead(tier, true, total_length);
     return buffer_handle;
 }
 
@@ -3169,6 +3190,7 @@ RealClient::batch_get_buffer_internal(
         QueryResult query_result;
         std::unique_ptr<BufferHandle> buffer_handle;
         std::vector<Slice> slices;
+        const char *tier;
     };
     struct DiskKeyOp {
         size_t original_index;
@@ -3176,6 +3198,7 @@ RealClient::batch_get_buffer_internal(
         QueryResult query_result;
         std::unique_ptr<BufferHandle> buffer_handle;
         uint64_t total_size;
+        const char *tier;
     };
     std::vector<KeyOp> valid_ops;
     std::vector<DiskKeyOp> disk_ops;
@@ -3190,6 +3213,9 @@ RealClient::batch_get_buffer_internal(
                 query_results[i].error() != ErrorCode::REPLICA_IS_NOT_READY) {
                 LOG(ERROR) << "Query failed for key '" << key
                            << "': " << toString(query_results[i].error());
+                client_->ObserveRead("query_error", false, 0);
+            } else {
+                client_->ObserveRead("query_miss", false, 0);
             }
             continue;
         }
@@ -3197,6 +3223,7 @@ RealClient::batch_get_buffer_internal(
         auto query_result_values = query_results[i].value();
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
+            client_->ObserveRead("no_replica", false, 0);
             continue;
         }
 
@@ -3206,19 +3233,23 @@ RealClient::batch_get_buffer_internal(
             SelectBestReplica(query_result_values.replicas, local_endpoints);
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
+            client_->ObserveRead("no_readable_replica", false, 0);
             continue;
         }
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
         if (total_size == 0) {
+            client_->ObserveRead("zero_length", false, 0);
             continue;
         }
+        const char *tier = ReadPathLabel(replica);
 
         auto &allocator = client_buffer_allocator ? client_buffer_allocator
                                                   : client_buffer_allocator_;
         auto alloc_result = allocator->allocate(total_size);
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate buffer for key: " << key;
+            client_->ObserveRead("buffer_allocation", false, 0);
             continue;
         }
 
@@ -3235,7 +3266,8 @@ RealClient::batch_get_buffer_internal(
                 .key = key,
                 .query_result = FilterQueryResult(query_result_values, replica),
                 .buffer_handle = std::move(buffer_handle),
-                .total_size = total_size});
+                .total_size = total_size,
+                .tier = tier});
             continue;
         }
 
@@ -3258,7 +3290,8 @@ RealClient::batch_get_buffer_internal(
             .key = key,
             .query_result = FilterQueryResult(query_result_values, replica),
             .buffer_handle = std::move(buffer_handle),
-            .slices = std::move(slices)});
+            .slices = std::move(slices),
+            .tier = tier});
     }
 
     if (valid_ops.empty() && disk_ops.empty()) {
@@ -3286,12 +3319,15 @@ RealClient::batch_get_buffer_internal(
         for (size_t i = 0; i < valid_ops.size(); ++i) {
             if (batch_get_results[i]) {
                 auto &op = valid_ops[i];
+                const auto bytes = op.buffer_handle->size();
                 final_results[op.original_index] =
                     std::make_shared<BufferHandle>(
                         std::move(*op.buffer_handle));
+                client_->ObserveRead(op.tier, true, bytes);
             } else {
                 LOG(ERROR) << "BatchGet failed for key '" << valid_ops[i].key
                            << "': " << toString(batch_get_results[i].error());
+                client_->ObserveRead(valid_ops[i].tier, false, 0);
             }
         }
     }
@@ -3317,6 +3353,7 @@ RealClient::batch_get_buffer_internal(
             }
             if (!replica_ptr) {
                 LOG(ERROR) << "No LOCAL_DISK replica found for key: " << op.key;
+                client_->ObserveRead(op.tier, false, 0);
                 continue;
             }
             const auto &replica = *replica_ptr;
@@ -3344,14 +3381,17 @@ RealClient::batch_get_buffer_internal(
                             << "SSD checksum verification failed for key '"
                             << key
                             << "': " << toString(checksum_result.error());
+                        client_->ObserveRead(op.tier, false, 0);
                         continue;
                     }
+                    client_->ObserveRead(op.tier, true, op.total_size);
                     final_results[op.original_index] =
                         std::make_shared<BufferHandle>(
                             std::move(*op.buffer_handle));
                 } else {
                     LOG(ERROR) << "SSD read failed for key '" << key
                                << "': " << toString(read_result.error());
+                    client_->ObserveRead(op.tier, false, 0);
                 }
             }
         }
@@ -5078,6 +5118,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         QueryResult query_result;
         std::vector<Slice> slices;
         uint64_t total_size;
+        const char *tier;
     };
     struct DiskKeyInfo {
         std::string key;
@@ -5086,6 +5127,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         Replica::Descriptor replica;
         void *dst_buffer;
         uint64_t total_size;
+        const char *tier;
     };
 
     std::vector<ValidKeyInfo> valid_operations;
@@ -5106,6 +5148,12 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 LOG(ERROR) << "Query failed for key '" << key
                            << "': " << toString(error);
             }
+            if (error == ErrorCode::OBJECT_NOT_FOUND ||
+                error == ErrorCode::REPLICA_IS_NOT_READY) {
+                client_->ObserveRead("query_miss", false, 0);
+            } else {
+                client_->ObserveRead("query_error", false, 0);
+            }
             continue;
         }
 
@@ -5114,6 +5162,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            client_->ObserveRead("no_replica", false, 0);
             continue;
         }
 
@@ -5124,6 +5173,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            client_->ObserveRead("no_readable_replica", false, 0);
             continue;
         }
 
@@ -5137,8 +5187,11 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                        << "': required=" << total_size
                        << ", available=" << sizes[i];
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            client_->ObserveRead("buffer_too_small", false, 0);
             continue;
         }
+
+        const char *tier = ReadPathLabel(replica);
 
         if (replica.is_local_disk_replica()) {
             std::vector<Slice> key_slices;
@@ -5149,7 +5202,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                              .original_index = i,
                              .query_result = std::move(query_result_values),
                              .slices = std::move(key_slices),
-                             .total_size = total_size});
+                             .total_size = total_size,
+                             .tier = tier});
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
@@ -5162,7 +5216,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                             .query_result = std::move(query_result_values),
                             .replica = replica,
                             .dst_buffer = buffers[i],
-                            .total_size = total_size});
+                            .total_size = total_size,
+                            .tier = tier});
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
@@ -5174,7 +5229,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
              .original_index = i,
              .query_result = FilterQueryResult(query_result_values, replica),
              .slices = std::move(key_slices),
-             .total_size = total_size});
+             .total_size = total_size,
+             .tier = tier});
 
         // Set success result (actual bytes transferred)
         results[i] = static_cast<int64_t>(total_size);
@@ -5213,6 +5269,9 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 LOG(ERROR) << "BatchGet failed for key '" << op.key
                            << "': " << toString(error);
                 results[op.original_index] = tl::unexpected(error);
+                client_->ObserveRead(op.tier, false, 0);
+            } else {
+                client_->ObserveRead(op.tier, true, op.total_size);
             }
         }
     }
@@ -5239,6 +5298,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                            << ", size: " << op.total_size;
                 results[op.original_index] =
                     tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                client_->ObserveRead(op.tier, false, 0);
                 continue;
             }
             auto handle =
@@ -5269,6 +5329,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                         << "': " << toString(disk_results[di].error());
                     results[op.original_index] =
                         tl::unexpected(disk_results[di].error());
+                    client_->ObserveRead(op.tier, false, 0);
                     continue;
                 }
                 if (auto r = scatter_host_to_maybe_device(
@@ -5278,6 +5339,9 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                         std::string(replica_type) + " read, key: " + key);
                     !r) {
                     results[op.original_index] = tl::make_unexpected(r.error());
+                    client_->ObserveRead(op.tier, false, 0);
+                } else {
+                    client_->ObserveRead(op.tier, true, op.total_size);
                 }
             }
         }
@@ -5301,6 +5365,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         if (!replica_ptr) {
             LOG(ERROR) << "No LOCAL_DISK replica found for key: "
                        << op_it.first;
+            client_->ObserveRead("local_disk", false, 0);
             continue;
         }
         const auto &replica = *replica_ptr;
@@ -5323,6 +5388,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 results[valid_local_disk_operations.at(offload_object_it.first)
                             .original_index] =
                     tl::make_unexpected(batch_get_offload_result.error());
+                client_->ObserveRead("local_disk", false, 0);
             }
             continue;
         }
@@ -5335,6 +5401,9 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             if (!checksum_result) {
                 results[op.original_index] =
                     tl::make_unexpected(checksum_result.error());
+                client_->ObserveRead("local_disk", false, 0);
+            } else {
+                client_->ObserveRead("local_disk", true, op.total_size);
             }
         }
     }

@@ -70,6 +70,7 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
     : transfer_metric(labels),
       master_client_metric(labels),
       transfer_operation_metric(labels),
+      cache_probe_metric(labels),
       ssd_metric(labels),
       should_stop_metrics_thread_(false),
       metrics_interval_seconds_(interval_seconds),
@@ -115,6 +116,7 @@ void ClientMetric::serialize(std::string& str) {
         master_client_metric.serialize(str);
     }
     transfer_operation_metric.serialize(str);
+    cache_probe_metric.serialize(str);
     ssd_metric.serialize(str);
 }
 
@@ -128,6 +130,7 @@ std::string ClientMetric::summary_metrics() {
         ss << "\n";
     }
     ss << transfer_operation_metric.summary_metrics();
+    ss << "\nPhysical cache probe metrics are exported via Prometheus";
     ss << "\n";
     ss << ssd_metric.summary_metrics();
     return ss.str();

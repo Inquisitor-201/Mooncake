@@ -3705,6 +3705,7 @@ tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     const std::vector<std::string>& keys) {
+    const auto start_time = std::chrono::steady_clock::now();
     auto response = master_client_.BatchExistKey(keys);
 
     // Check if we got the expected number of responses
@@ -3717,8 +3718,34 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
         for (size_t i = 0; i < keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
         }
+        ObserveBatchIsExist(
+            keys.size(), 0, 0, keys.size(),
+            static_cast<uint64_t>(std::chrono::duration_cast<
+                                      std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() -
+                                      start_time)
+                                      .count()));
         return results;
     }
+
+    size_t hits = 0;
+    size_t misses = 0;
+    size_t errors = 0;
+    for (const auto& item : response) {
+        if (!item) {
+            ++errors;
+        } else if (item.value()) {
+            ++hits;
+        } else {
+            ++misses;
+        }
+    }
+    ObserveBatchIsExist(
+        keys.size(), hits, misses, errors,
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() -
+                                  start_time)
+                                  .count()));
 
     // Return the response directly as it's already in the correct
     // format

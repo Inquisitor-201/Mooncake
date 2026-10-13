@@ -209,6 +209,32 @@ TEST_F(ClientMetricsTest, ClientMetricsSummaryTest) {
     std::cout << "Full Client Metrics Summary:\n" << summary << std::endl;
 }
 
+TEST_F(ClientMetricsTest, CacheProbeMetricsSerializationTest) {
+    ClientMetric metrics;
+    metrics.ObserveBatchIsExist(/*items=*/3, /*hits=*/1, /*misses=*/1,
+                                /*errors=*/1, /*latency_us=*/420);
+    metrics.ObserveRead("local_disk", /*success=*/true, /*bytes=*/1024);
+    metrics.ObserveRead("memory", /*success=*/false, /*bytes=*/0);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    EXPECT_NE(serialized.find("mooncake_client_batch_is_exist_items_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_client_batch_is_exist_hits_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_client_batch_is_exist_latency_us"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_client_read_attempts_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_client_read_successes_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_client_read_errors_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_client_read_bytes_total"),
+              std::string::npos);
+}
+
 TEST_F(ClientMetricsTest, ByteFormattingTest) {
     TransferMetric metrics;
 

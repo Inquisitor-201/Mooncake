@@ -623,6 +623,20 @@ class Client {
         }
     }
 
+    void ObserveBatchIsExist(size_t items, size_t hits, size_t misses,
+                             size_t errors, uint64_t latency_us) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveBatchIsExist(items, hits, misses, errors,
+                                          latency_us);
+        }
+    }
+
+    void ObserveRead(const std::string& tier, bool success, uint64_t bytes) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveRead(tier, success, bytes);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {
