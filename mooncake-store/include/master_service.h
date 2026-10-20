@@ -141,6 +141,11 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * tenant_quota_recompute_mutex_ serializes the capacity snapshot and the
  * corresponding quota-table update. The segment mutex is released before
  * entering ShardedTenantQuotaTable, so these two locks are never nested.
+ *
+ * Two dedicated guards sit outside this order: remount_mutex_ is only
+ * acquired at the top of ReMountSegment, before client_mutex_, and nothing
+ * acquires it while holding any lock above; client_status_mutex_ guards the
+ * ok_client_ mirror and is never held while acquiring any other lock.
  */
 class MasterService {
     // Test friend class for snapshot/restore testing
@@ -994,6 +999,13 @@ class MasterService {
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
+    // Liveness-complement sweep that re-captures the retaining-client set per
+    // shard: a client that mounts or remounts while the sweep is between
+    // shards is seen alive for the shards not yet walked, so its replicas
+    // cannot be misclassified as stale (a point-in-time capture taken before
+    // an O(total keys) walk could erase a concurrently mounting client's
+    // fresh replicas). The per-shard capture runs under client_mutex_ shared
+    // only, so callers must not hold snapshot_mutex_.
     void ClearInvalidHandles();
     // Caller owns snapshot_mutex_ (shared) while metadata is swept.
     void ClearInvalidHandles(
@@ -1006,8 +1018,19 @@ class MasterService {
     // misclassify a concurrent mount, whatever the interleaving.
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
     // Shard walk shared by the two sweeps above; removes completed replicas
-    // matching is_stale, erasing a key when no valid replica remains.
-    void ClearStaleHandles(const std::function<bool(const Replica&)>& is_stale);
+    // matching is_stale, erasing a key when no valid replica remains. Each
+    // shard is first scanned under its shared lock to pick the keys that
+    // match, and only those are cleaned, in bounded batches under the write
+    // lock: a mass client expiry marks handles stale table-wide, and walking
+    // a whole shard while holding it exclusively blocked every RPC for that
+    // shard until the sweep moved on.
+    tl::expected<void, ErrorCode> ClearStaleHandles(
+        const std::function<bool(const Replica&)>& is_stale);
+    // Sweeps a single shard: a shared-lock scan picks the keys that match,
+    // and only those are cleaned in bounded batches under the write lock.
+    tl::expected<void, ErrorCode> ClearStaleHandlesInShard(
+        size_t shard_index,
+        const std::function<bool(const Replica&)>& is_stale);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -2450,6 +2473,20 @@ class MasterService {
     mutable std::shared_mutex client_mutex_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
+    // Mirror of ok_client_ maintained at every mutation, all of which run
+    // under client_mutex_ exclusive, so the mirror never diverges for more
+    // than the duration of one mutation. Ping answers OK/NEED_REMOUNT from
+    // this copy under a mutex whose exclusive holds are only the
+    // microseconds of an insert or erase, so heartbeat processing never
+    // waits behind long client_mutex_ exclusive sections (remount admission,
+    // monitor expiry erasure).
+    mutable std::shared_mutex client_status_mutex_;
+    std::unordered_set<UUID, boost::hash<UUID>> client_status_view_;
+    // Serializes concurrent ReMountSegment calls, replacing the implicit
+    // serialization the pre-fix whole-body client_mutex_/snapshot_mutex_
+    // exclusive hold provided. Never acquired by any other path, so it
+    // cannot couple unrelated operations together.
+    std::mutex remount_mutex_;
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
