@@ -1,16 +1,282 @@
-name: Build L3 metrics validation wheel
+name: Build L3 metrics wheels
+
+# Build the instrumented Mooncake wheels (cache probe / read tier metrics)
+# from the pinned source revision, reproducing the configurations validated on
+# the 11524 test cluster:
+#   - cuda13 / x86_64 / CPython 3.12  -> worker image wheel
+#   - non-cuda / x86_64 / CPython 3.10 -> store pod wheel
+# Wheels are downloaded from the run artifacts and published to OSS.
 
 on:
+  push:
+    branches:
+      - chenlinkun/l3-cache-diag-20261024
   workflow_dispatch:
 
 jobs:
-  build-cuda13-cp312:
+  build-cuda13-py312:
+    runs-on: ubuntu-22.04
+    container: pytorch/manylinux2_28-builder:cuda13.0
     permissions:
       contents: read
-    uses: ./.github/workflows/_build-wheel.yaml
-    with:
-      variant: cuda13
-      architecture: x86_64
-      python-versions: '["3.12"]'
-      artifact-prefix: mooncake-l3-metrics-cuda13
-      version-override: 0.3.13.post1+l3metrics20261013
+    env:
+      BUILD_ARCHITECTURE: x86_64
+      BUILD_VARIANT: cuda13
+      SOURCE_SHA: bab8a5b2c1292347a11d3c4ae87a0c27b93e77a8
+      VERSION: 0.3.13.post1+l3diag20261024
+    steps:
+      - name: Checkout pinned source
+        uses: actions/checkout@v4
+        with:
+          ref: bab8a5b2c1292347a11d3c4ae87a0c27b93e77a8
+
+      - name: Verify pinned revision
+        run: |
+          git config --global --add safe.directory '*'
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Configure build profile
+        shell: bash
+        run: |
+          {
+            echo "VARIANT_FLAG=CU13_BUILD"
+            echo "CMAKE_GEN="
+            echo "TORCH_CUDA_ARCH_LIST=8.0;9.0;10.3"
+            echo "BUILD_NVLINK_ALLOCATOR=false"
+            echo "CMAKE_ARGS=-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DWITH_STORE_RUST=OFF -DCMAKE_BUILD_TYPE=Release"
+          } >> "$GITHUB_ENV"
+
+      - name: Patch wheel version in pyproject.toml
+        run: |
+          sed -i "s/^version = .*/version = \"$VERSION\"/" mooncake-wheel/pyproject.toml
+          grep -q "^version = \"$VERSION\"" mooncake-wheel/pyproject.toml
+
+      - name: Select Python 3.12 from manylinux image
+        run: |
+          PYBIN="/opt/python/cp312-cp312/bin"
+          echo "$PYBIN" >> "$GITHUB_PATH"
+          "$PYBIN/pip" install --quiet "cmake<4" setuptools wheel
+
+      - name: Configure project
+        run: |
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+          if [ -n "$SUDO" ] && command -v apt-get >/dev/null 2>&1; then
+            $SUDO apt-get update -y || true
+          fi
+          $SUDO bash -x dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          gen=(); [ -n "$CMAKE_GEN" ] && gen=(-G "$CMAKE_GEN")
+          mkdir -p build && cd build
+          # shellcheck disable=SC2086
+          cmake "${gen[@]}" .. $CMAKE_ARGS -DPython3_EXECUTABLE="$(which python3)"
+
+      - name: Build project
+        env:
+          MAX_JOBS: "2"
+        run: |
+          for dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
+            [ -d "$dir" ] && export LIBRARY_PATH="$dir:${LIBRARY_PATH:-}"
+          done
+          [ -d /usr/local/cuda ] && export CUDA_HOME=/usr/local/cuda
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -E"
+          cd build
+          cmake --build . -j"$(nproc)"
+          $SUDO cmake --install .
+
+      - name: Build Python wheel
+        run: |
+          [ -d /usr/local/cuda ] && export CUDA_HOME=/usr/local/cuda
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
+          variant=()
+          [ -n "$VARIANT_FLAG" ] && variant=("$VARIANT_FLAG=1")
+          env "${variant[@]}" \
+            PYTHON_VERSION=3.12 \
+            OUTPUT_DIR="dist-py312" \
+            ./scripts/build_wheel.sh
+        env:
+          VERSION: ${{ env.VERSION }}
+
+      - name: Verify wheel content
+        shell: bash
+        run: |
+          WHL=$(ls mooncake-wheel/dist-py312/*.whl)
+          echo "wheel: $WHL"
+          unzip -o -q "$WHL" -d /tmp/wheel-check
+          STORE_SO=$(find /tmp/wheel-check -name 'store*.so' | head -1)
+          test -n "$STORE_SO"
+          for sym in mooncake_client_batch_is_exist_items_total \
+                     mooncake_client_batch_is_exist_hits_total \
+                     mooncake_client_read_attempts_total \
+                     mooncake_client_read_successes_total \
+                     mooncake_client_read_errors_total \
+                     mooncake_client_read_bytes_total \
+                     MOONCAKE_DIAG_OVERFLOW_POLICY; do
+            if ! grep -q "$sym" "$STORE_SO"; then
+              echo "::error::metric symbol missing in store.so: $sym"
+              exit 1
+            fi
+          done
+          grep -q "Version: $VERSION" /tmp/wheel-check/*.dist-info/METADATA
+
+      - name: Smoke test wheel
+        shell: bash
+        run: |
+          smoke_venv=$(mktemp -d)
+          python -m venv "$smoke_venv"
+          "$smoke_venv/bin/python" -m pip install --no-deps \
+            mooncake-wheel/dist-py312/*.whl
+          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          for dir in /usr/local/cuda/lib64 \
+                     /usr/local/cuda/lib64/stubs \
+                     /usr/local/cuda/targets/*/lib \
+                     /usr/local/cuda/targets/*/lib/stubs; do
+            [ -d "$dir" ] && export LD_LIBRARY_PATH="$dir:$LD_LIBRARY_PATH"
+          done
+          cuda_stub=
+          for candidate in /usr/local/cuda/lib64/stubs/libcuda.so \
+                           /usr/local/cuda/targets/*/lib/stubs/libcuda.so; do
+            if [ -f "$candidate" ]; then
+              cuda_stub="$candidate"
+              break
+            fi
+          done
+          if [ -n "$cuda_stub" ]; then
+            ln -s "$cuda_stub" "$smoke_venv/libcuda.so.1"
+            export LD_LIBRARY_PATH="$smoke_venv:$LD_LIBRARY_PATH"
+          fi
+          "$smoke_venv/bin/mooncake_master" --version
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-l3-metrics-cuda13-py312
+          path: mooncake-wheel/dist-py312/*.whl
+
+  build-noncuda-py310:
+    runs-on: ubuntu-22.04
+    container: pytorch/manylinux2_28-builder:cuda12.8
+    permissions:
+      contents: read
+    env:
+      BUILD_ARCHITECTURE: x86_64
+      BUILD_VARIANT: non-cuda
+      SOURCE_SHA: bab8a5b2c1292347a11d3c4ae87a0c27b93e77a8
+      VERSION: 0.3.13.post1+l3diag20261024
+    steps:
+      - name: Checkout pinned source
+        uses: actions/checkout@v4
+        with:
+          ref: bab8a5b2c1292347a11d3c4ae87a0c27b93e77a8
+
+      - name: Verify pinned revision
+        run: |
+          git config --global --add safe.directory '*'
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Configure build profile
+        shell: bash
+        run: |
+          {
+            echo "VARIANT_FLAG=NON_CUDA_BUILD"
+            echo "CMAKE_GEN="
+            echo "TORCH_CUDA_ARCH_LIST="
+            echo "BUILD_NVLINK_ALLOCATOR=false"
+            echo "CMAKE_ARGS=-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DWITH_STORE_RUST=OFF -DCMAKE_BUILD_TYPE=Release"
+          } >> "$GITHUB_ENV"
+
+      - name: Patch wheel version in pyproject.toml
+        run: |
+          sed -i "s/^version = .*/version = \"$VERSION\"/" mooncake-wheel/pyproject.toml
+          grep -q "^version = \"$VERSION\"" mooncake-wheel/pyproject.toml
+
+      - name: Select Python 3.10 from manylinux image
+        run: |
+          PYBIN="/opt/python/cp310-cp310/bin"
+          echo "$PYBIN" >> "$GITHUB_PATH"
+          "$PYBIN/pip" install --quiet "cmake<4" setuptools wheel
+
+      - name: Configure project
+        run: |
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+          if [ -n "$SUDO" ] && command -v apt-get >/dev/null 2>&1; then
+            $SUDO apt-get update -y || true
+          fi
+          $SUDO bash -x dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          gen=(); [ -n "$CMAKE_GEN" ] && gen=(-G "$CMAKE_GEN")
+          mkdir -p build && cd build
+          # shellcheck disable=SC2086
+          cmake "${gen[@]}" .. $CMAKE_ARGS -DPython3_EXECUTABLE="$(which python3)"
+
+      - name: Build project
+        env:
+          MAX_JOBS: "2"
+        run: |
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -E"
+          cd build
+          cmake --build . -j"$(nproc)"
+          $SUDO cmake --install .
+
+      - name: Build Python wheel
+        run: |
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
+          variant=()
+          [ -n "$VARIANT_FLAG" ] && variant=("$VARIANT_FLAG=1")
+          env "${variant[@]}" \
+            PYTHON_VERSION=3.10 \
+            OUTPUT_DIR="dist-py310" \
+            ./scripts/build_wheel.sh
+        env:
+          VERSION: ${{ env.VERSION }}
+
+      - name: Verify wheel content
+        shell: bash
+        run: |
+          WHL=$(ls mooncake-wheel/dist-py310/*.whl)
+          echo "wheel: $WHL"
+          unzip -o -q "$WHL" -d /tmp/wheel-check
+          STORE_SO=$(find /tmp/wheel-check -name 'store*.so' | head -1)
+          test -n "$STORE_SO"
+          for sym in mooncake_client_batch_is_exist_items_total \
+                     mooncake_client_read_attempts_total \
+                     MOONCAKE_DIAG_OVERFLOW_POLICY; do
+            if ! grep -q "$sym" "$STORE_SO"; then
+              echo "::error::metric symbol missing in store.so: $sym"
+              exit 1
+            fi
+          done
+          grep -q "Version: $VERSION" /tmp/wheel-check/*.dist-info/METADATA
+
+      - name: Smoke test wheel
+        shell: bash
+        run: |
+          smoke_venv=$(mktemp -d)
+          python -m venv "$smoke_venv"
+          "$smoke_venv/bin/python" -m pip install --no-deps \
+            mooncake-wheel/dist-py310/*.whl
+          site_packages=$("$smoke_venv/bin/python" -c \
+            'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+          cuda_dependency_found=false
+          for package_path in "$site_packages"/mooncake*; do
+            [ -e "$package_path" ] || continue
+            while IFS= read -r -d '' file; do
+              cuda_dependencies=$(readelf -d "$file" 2>/dev/null | grep -E \
+                'Shared library: \[(libcuda|libcudart|libcublas|libcufft|libcurand|libcusolver|libcusparse|libcufile|libcupti|libnvrtc|libnvJitLink|libnvToolsExt|libnvfatbin|libnvidia|libnccl)\.so' || true)
+              if [ -n "$cuda_dependencies" ]; then
+                echo "::error file=$file::Non-CUDA wheel artifact depends on CUDA"
+                echo "$cuda_dependencies"
+                cuda_dependency_found=true
+              fi
+            done < <(find "$package_path" -type f -print0)
+          done
+          if [ "$cuda_dependency_found" = true ]; then
+            exit 1
+          fi
+          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          "$smoke_venv/bin/mooncake_master" --version
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-l3-metrics-noncuda-py310
+          path: mooncake-wheel/dist-py310/*.whl
