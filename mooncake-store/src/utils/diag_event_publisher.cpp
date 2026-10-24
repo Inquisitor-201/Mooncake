@@ -157,6 +157,19 @@ DiagConfig DiagConfig::FromEnv() {
     config.directory = GetEnvString("MOONCAKE_DIAG_DIR", "");
     config.enabled = !config.directory.empty();
     config.node_name = GetEnvString("MOONCAKE_DIAG_NODE", "");
+    if (config.node_name.empty()) {
+        char hostname[256] = {0};
+        if (::gethostname(hostname, sizeof(hostname) - 1) == 0) {
+            config.node_name = hostname;
+        }
+    }
+    if (!config.directory.empty() && config.directory.front() != '/') {
+        const char* install_root = std::getenv("HIPPO_APP_INST_ROOT");
+        if (install_root != nullptr && *install_root != '\0') {
+            config.directory =
+                std::string(install_root) + "/" + config.directory;
+        }
+    }
     config.overflow_policy =
         GetEnvString("MOONCAKE_DIAG_OVERFLOW_POLICY", "drop");
     config.queue_events = GetEnvSize("MOONCAKE_DIAG_QUEUE_EVENTS", 65536);
