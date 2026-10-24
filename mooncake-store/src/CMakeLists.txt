@@ -60,6 +60,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     hot_standby_service.cpp
     metadata_store.cpp
     standby_state_machine.cpp
+    utils/diag_event_publisher.cpp
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES

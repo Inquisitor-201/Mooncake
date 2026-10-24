@@ -46,6 +46,7 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
 #include "kv_event/kv_event_publisher.h"
+#include "utils/diag_event_publisher.h"
 #include "ha/oplog/oplog_types.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "allocator.h"
@@ -1006,10 +1007,13 @@ class MasterService {
     // an O(total keys) walk could erase a concurrently mounting client's
     // fresh replicas). The per-shard capture runs under client_mutex_ shared
     // only, so callers must not hold snapshot_mutex_.
-    void ClearInvalidHandles();
-    // Caller owns snapshot_mutex_ (shared) while metadata is swept.
     void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
+        const std::string& reason = "scheduled_cleanup");
+    // Caller owns snapshot_mutex_ (shared) while metadata is swept.
+    // `reason` is diagnostic only and is recorded on every removal.
+    void ClearInvalidHandles(
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
+        const std::string& reason = "scheduled_cleanup");
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
     // all shards. Owner-targeted on purpose: a liveness-complement sweep
     // classifies by absence from a point-in-time set, so an owner that
@@ -1025,12 +1029,13 @@ class MasterService {
     // a whole shard while holding it exclusively blocked every RPC for that
     // shard until the sweep moved on.
     tl::expected<void, ErrorCode> ClearStaleHandles(
-        const std::function<bool(const Replica&)>& is_stale);
+        const std::function<bool(const Replica&)>& is_stale,
+        const std::string& reason);
     // Sweeps a single shard: a shared-lock scan picks the keys that match,
     // and only those are cleaned in bounded batches under the write lock.
     tl::expected<void, ErrorCode> ClearStaleHandlesInShard(
-        size_t shard_index,
-        const std::function<bool(const Replica&)>& is_stale);
+        size_t shard_index, const std::function<bool(const Replica&)>& is_stale,
+        const std::string& reason);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -2829,6 +2834,22 @@ class MasterService {
         drain_jobs_ GUARDED_BY(job_mutex_);
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
+    std::unique_ptr<DiagEventPublisher> diag_publisher_;
+
+    void PublishDiagObjectStored(const std::string& key,
+                                 const ObjectMetadata& metadata);
+    void PublishDiagObjectRemoved(const std::string& key,
+                                  const ObjectMetadata& metadata,
+                                  const std::string& reason);
+    void PublishDiagReplicasRemoved(const std::string& key,
+                                    const std::string& tenant,
+                                    const std::vector<DiagReplicaInfo>& removed,
+                                    size_t remaining_replicas,
+                                    const std::string& reason);
+    void PublishDiagSegment(const std::string& segment_name,
+                            const std::string& endpoint,
+                            const std::string& phase,
+                            const std::string& reason);
 
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
     static std::string MediumForReplicaType(ReplicaType replica_type);
