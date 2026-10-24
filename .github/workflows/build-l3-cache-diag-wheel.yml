@@ -20,13 +20,13 @@ jobs:
     env:
       BUILD_ARCHITECTURE: x86_64
       BUILD_VARIANT: non-cuda
-      SOURCE_SHA: a52894acdc81944117bb213bbc3b2042abc34816
+      SOURCE_SHA: dcafeb9b8964ad27463e2cd9f78a52d0c34d51e5
       VERSION: 0.3.13+diag20261025
     steps:
       - name: Checkout pinned source
         uses: actions/checkout@v4
         with:
-          ref: a52894acdc81944117bb213bbc3b2042abc34816
+          ref: dcafeb9b8964ad27463e2cd9f78a52d0c34d51e5
 
       - name: Verify pinned revision
         run: |
