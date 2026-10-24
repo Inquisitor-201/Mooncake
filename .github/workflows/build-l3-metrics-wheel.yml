@@ -227,7 +227,7 @@ jobs:
           [ -n "$VARIANT_FLAG" ] && variant=("$VARIANT_FLAG=1")
           env "${variant[@]}" \
             PYTHON_VERSION=3.12 \
-            OUTPUT_DIR="dist-py310" \
+            OUTPUT_DIR="dist-py312" \
             ./scripts/build_wheel.sh
         env:
           VERSION: ${{ env.VERSION }}
