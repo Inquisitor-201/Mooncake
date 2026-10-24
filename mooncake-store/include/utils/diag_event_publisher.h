@@ -95,9 +95,11 @@ class DiagEventPublisher {
    private:
     void Enqueue(std::string line);
     void WorkerLoop();
-    void OpenNewFileLocked();
-    void ShiftHistoryLocked();
-    void PruneHistoryLocked();
+    // Writer-thread only: file IO runs without mutex_ so a data-path publish
+    // can never wait behind fwrite or rotation.
+    void OpenNewFile();
+    void ShiftHistory();
+    void PruneHistory();
     bool HasRoomLocked(size_t size) const;
 
     DiagConfig config_;
@@ -116,8 +118,11 @@ class DiagEventPublisher {
     size_t file_bytes_ = 0;
     std::atomic<uint64_t> seq_{0};
     std::atomic<bool> block_on_full_{true};
-    // Drops taken without acquiring mutex_ on the master-side fast path.
-    std::atomic<uint64_t> fast_drops_{0};
+    // Writer-thread owned; mirrored into current_path_ under mutex_ for the
+    // getter only.
+    std::string writer_path_;
+    uint64_t flush_generation_ = 0;
+    uint64_t flushed_generation_ = 0;
 };
 
 }  // namespace mooncake

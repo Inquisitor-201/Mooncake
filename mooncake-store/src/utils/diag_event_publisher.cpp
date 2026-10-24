@@ -292,17 +292,11 @@ void DiagEventPublisher::PublishSegmentEvent(
 
 void DiagEventPublisher::Enqueue(std::string line) {
     const size_t size = line.size();
-    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        if (!block_on_full_.load()) {
-            // Master-side publishers run while holding metadata/client locks.
-            // Never wait behind the writer thread's fwrite or rotation; count
-            // the drop and let the caller proceed.
-            fast_drops_.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-        lock.lock();
-    }
+    // The writer thread never holds mutex_ while doing file IO, so the only
+    // wait here is the microsecond-scale queue update. Master-side publishers
+    // additionally pass block_on_full_=false so a full queue drops instead of
+    // parking the caller (which may hold metadata/client locks).
+    std::unique_lock<std::mutex> lock(mutex_);
     if (stop_) {
         stats_.dropped++;
         return;
@@ -345,10 +339,26 @@ void DiagEventPublisher::WorkerLoop() {
         std::string line;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            queue_cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+            queue_cv_.wait(lock, [&] {
+                return stop_ || !queue_.empty() ||
+                       flush_generation_ > flushed_generation_;
+            });
             if (queue_.empty()) {
                 if (stop_) {
+                    if (file_ != nullptr) {
+                        std::fflush(file_);
+                    }
                     break;
+                }
+                if (flush_generation_ > flushed_generation_) {
+                    const uint64_t target = flush_generation_;
+                    lock.unlock();
+                    if (file_ != nullptr) {
+                        std::fflush(file_);
+                    }
+                    lock.lock();
+                    flushed_generation_ = target;
+                    drain_cv_.notify_all();
                 }
                 continue;
             }
@@ -359,48 +369,65 @@ void DiagEventPublisher::WorkerLoop() {
         queue_cv_.notify_all();
 
         bool ok = true;
+        try {
+            if (file_ == nullptr ||
+                (file_bytes_ > 0 &&
+                 file_bytes_ + line.size() > config_.max_file_bytes)) {
+                OpenNewFile();
+            }
+            if (file_ == nullptr ||
+                std::fwrite(line.data(), 1, line.size(), file_) != line.size()) {
+                ok = false;
+            } else {
+                file_bytes_ += line.size();
+            }
+        } catch (...) {
+            ok = false;
+        }
+
+        uint64_t flush_to = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            try {
-                if (file_ == nullptr ||
-                    (file_bytes_ > 0 &&
-                     file_bytes_ + line.size() > config_.max_file_bytes)) {
-                    OpenNewFileLocked();
-                }
-                if (file_ == nullptr ||
-                    std::fwrite(line.data(), 1, line.size(), file_) !=
-                        line.size()) {
-                    ok = false;
-                } else {
-                    file_bytes_ += line.size();
-                }
-            } catch (...) {
-                ok = false;
-            }
             if (ok) {
                 stats_.written++;
             } else {
                 stats_.write_errors++;
             }
             pending_--;
+            if (pending_ == 0 && flush_generation_ > flushed_generation_) {
+                flush_to = flush_generation_;
+            }
         }
-        drain_cv_.notify_all();
+        if (flush_to != 0) {
+            if (file_ != nullptr) {
+                std::fflush(file_);
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                flushed_generation_ = flush_to;
+            }
+            drain_cv_.notify_all();
+        }
     }
 }
 
-void DiagEventPublisher::OpenNewFileLocked() {
+void DiagEventPublisher::OpenNewFile() {
     if (file_ != nullptr) {
         std::fflush(file_);
         std::fclose(file_);
         file_ = nullptr;
-        ShiftHistoryLocked();
+        ShiftHistory();
     }
     std::string base = config_.directory + "/master_diag";
     if (!config_.node_name.empty()) {
         base += "_" + config_.node_name;
     }
     base += "_" + std::to_string(static_cast<long long>(::getpid())) + ".jsonl";
-    current_path_ = base;
+    writer_path_ = base;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        current_path_ = base;
+    }
     file_ = std::fopen(base.c_str(), "a");
     file_bytes_ = 0;
     if (file_ != nullptr) {
@@ -411,32 +438,32 @@ void DiagEventPublisher::OpenNewFileLocked() {
             }
         }
     }
-    PruneHistoryLocked();
+    PruneHistory();
 }
 
-void DiagEventPublisher::ShiftHistoryLocked() {
-    if (current_path_.empty()) {
+void DiagEventPublisher::ShiftHistory() {
+    if (writer_path_.empty()) {
         return;
     }
     for (size_t index = config_.keep_files - 1; index > 0; --index) {
-        std::string source = current_path_ + "." + std::to_string(index);
-        std::string target = current_path_ + "." + std::to_string(index + 1);
+        std::string source = writer_path_ + "." + std::to_string(index);
+        std::string target = writer_path_ + "." + std::to_string(index + 1);
         std::error_code error;
         if (std::filesystem::exists(source, error)) {
             std::filesystem::rename(source, target, error);
         }
     }
     std::error_code error;
-    std::filesystem::rename(current_path_, current_path_ + ".1", error);
+    std::filesystem::rename(writer_path_, writer_path_ + ".1", error);
 }
 
-void DiagEventPublisher::PruneHistoryLocked() {
-    if (current_path_.empty()) {
+void DiagEventPublisher::PruneHistory() {
+    if (writer_path_.empty()) {
         return;
     }
     for (size_t index = config_.keep_files;
          index < config_.keep_files + 100; ++index) {
-        std::string stale = current_path_ + "." + std::to_string(index);
+        std::string stale = writer_path_ + "." + std::to_string(index);
         std::error_code error;
         std::filesystem::remove(stale, error);
     }
@@ -449,22 +476,19 @@ bool DiagEventPublisher::Flush(uint64_t timeout_ms) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeout_ms);
     std::unique_lock<std::mutex> lock(mutex_);
-    while (pending_ > 0) {
+    const uint64_t target = ++flush_generation_;
+    queue_cv_.notify_all();
+    while (flushed_generation_ < target) {
         if (drain_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
             return false;
         }
-    }
-    if (file_ != nullptr) {
-        std::fflush(file_);
     }
     return true;
 }
 
 DiagEventPublisher::Stats DiagEventPublisher::GetStats() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    Stats stats = stats_;
-    stats.dropped += fast_drops_.load(std::memory_order_relaxed);
-    return stats;
+    return stats_;
 }
 
 std::string DiagEventPublisher::current_path() const {
