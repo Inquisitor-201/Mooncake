@@ -9784,6 +9784,8 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
         ok_client_.clear();
+        std::unique_lock<std::shared_mutex> status_lock(client_status_mutex_);
+        client_status_view_.clear();
     }
     PodUUID pod_uuid;
     while (client_ping_queue_.pop(pod_uuid)) {
