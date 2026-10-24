@@ -292,7 +292,17 @@ void DiagEventPublisher::PublishSegmentEvent(
 
 void DiagEventPublisher::Enqueue(std::string line) {
     const size_t size = line.size();
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        if (!block_on_full_.load()) {
+            // Master-side publishers run while holding metadata/client locks.
+            // Never wait behind the writer thread's fwrite or rotation; count
+            // the drop and let the caller proceed.
+            fast_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        lock.lock();
+    }
     if (stop_) {
         stats_.dropped++;
         return;
@@ -452,7 +462,9 @@ bool DiagEventPublisher::Flush(uint64_t timeout_ms) {
 
 DiagEventPublisher::Stats DiagEventPublisher::GetStats() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return stats_;
+    Stats stats = stats_;
+    stats.dropped += fast_drops_.load(std::memory_order_relaxed);
+    return stats;
 }
 
 std::string DiagEventPublisher::current_path() const {

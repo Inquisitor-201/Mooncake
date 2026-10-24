@@ -116,6 +116,8 @@ class DiagEventPublisher {
     size_t file_bytes_ = 0;
     std::atomic<uint64_t> seq_{0};
     std::atomic<bool> block_on_full_{true};
+    // Drops taken without acquiring mutex_ on the master-side fast path.
+    std::atomic<uint64_t> fast_drops_{0};
 };
 
 }  // namespace mooncake
