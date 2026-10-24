@@ -109,13 +109,16 @@ jobs:
                      mooncake_client_read_attempts_total \
                      mooncake_client_read_successes_total \
                      mooncake_client_read_errors_total \
-                     mooncake_client_read_bytes_total \
-                     MOONCAKE_DIAG_OVERFLOW_POLICY; do
+                     mooncake_client_read_bytes_total; do
             if ! grep -q "$sym" "$STORE_SO"; then
               echo "::error::metric symbol missing in store.so: $sym"
               exit 1
             fi
           done
+          if ! grep -rqa "MOONCAKE_DIAG_OVERFLOW_POLICY" /tmp/wheel-check; then
+            echo "::error::diagnostic marker missing from the wheel (master binary)"
+            exit 1
+          fi
           grep -q "Version: $VERSION" /tmp/wheel-check/*.dist-info/METADATA
 
       - name: Smoke test wheel
@@ -238,13 +241,16 @@ jobs:
           STORE_SO=$(find /tmp/wheel-check -name 'store*.so' | head -1)
           test -n "$STORE_SO"
           for sym in mooncake_client_batch_is_exist_items_total \
-                     mooncake_client_read_attempts_total \
-                     MOONCAKE_DIAG_OVERFLOW_POLICY; do
+                     mooncake_client_read_attempts_total; do
             if ! grep -q "$sym" "$STORE_SO"; then
               echo "::error::metric symbol missing in store.so: $sym"
               exit 1
             fi
           done
+          if ! grep -rqa "MOONCAKE_DIAG_OVERFLOW_POLICY" /tmp/wheel-check; then
+            echo "::error::diagnostic marker missing from the wheel (master binary)"
+            exit 1
+          fi
           grep -q "Version: $VERSION" /tmp/wheel-check/*.dist-info/METADATA
 
       - name: Smoke test wheel
