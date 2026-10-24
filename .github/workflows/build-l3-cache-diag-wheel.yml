@@ -20,13 +20,13 @@ jobs:
     env:
       BUILD_ARCHITECTURE: x86_64
       BUILD_VARIANT: non-cuda
-      SOURCE_SHA: ce523b94f515a6d427c3e7953d160f48d366df91
+      SOURCE_SHA: a52894acdc81944117bb213bbc3b2042abc34816
       VERSION: 0.3.13+diag20261025
     steps:
       - name: Checkout pinned source
         uses: actions/checkout@v4
         with:
-          ref: ce523b94f515a6d427c3e7953d160f48d366df91
+          ref: a52894acdc81944117bb213bbc3b2042abc34816
 
       - name: Verify pinned revision
         run: |
@@ -106,6 +106,55 @@ jobs:
             exit 1
           fi
           grep -q "Version: $VERSION" /tmp/wheel-check/*.dist-info/METADATA
+
+      - name: Smoke test diagnostic JSONL
+        shell: bash
+        run: |
+          cat > /tmp/diag_smoke.cpp <<'CPP'
+          #include "utils/diag_event_publisher.h"
+
+          #include <filesystem>
+          #include <fstream>
+          #include <iostream>
+          #include <sstream>
+
+          int main() {
+              const std::string dir = "/tmp/diag_smoke_out";
+              std::filesystem::remove_all(dir);
+              std::filesystem::create_directories(dir);
+              mooncake::DiagConfig config;
+              config.enabled = true;
+              config.directory = dir;
+              config.node_name = "ci";
+              mooncake::DiagEventPublisher publisher(config);
+              publisher.set_block_on_full(false);
+              publisher.PublishObjectStored("k1", "t1", 123, {});
+              publisher.PublishSegmentEvent("s1", "seg", "10.0.0.1:1",
+                                            "unreadable", "unmount");
+              if (!publisher.Flush(5000)) {
+                  return 1;
+              }
+              std::ifstream input(publisher.current_path());
+              std::stringstream buffer;
+              buffer << input.rdbuf();
+              std::cout << buffer.str();
+              return 0;
+          }
+          CPP
+          g++ -std=c++20 -pthread -I mooncake-store/include \
+            /tmp/diag_smoke.cpp mooncake-store/src/utils/diag_event_publisher.cpp \
+            -o /tmp/diag_smoke
+          /tmp/diag_smoke > /tmp/diag_smoke.jsonl
+          python3 - <<'PY'
+          import json
+
+          lines = [l for l in open('/tmp/diag_smoke.jsonl') if l.strip()]
+          assert len(lines) == 2, lines
+          for line in lines:
+              json.loads(line)
+              assert line.startswith('{"event":'), line
+          print('diagnostic JSONL ok:', len(lines), 'lines')
+          PY
 
       - name: Smoke test wheel
         shell: bash
