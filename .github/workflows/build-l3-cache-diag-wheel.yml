@@ -1,0 +1,124 @@
+name: Build L3 cache diagnostics wheel
+
+# Builds the store/master wheel used by the test-cluster package:
+# 0.3.13 + the remount-lock fix (port of PR #4801) + structured lifecycle
+# diagnostics. The store pod does not need CUDA, so only the non-CUDA
+# CPython 3.12 wheel is produced here.
+
+on:
+  push:
+    branches:
+      - chenlinkun/l3-cache-diag-0.3.13-4801
+  workflow_dispatch:
+
+jobs:
+  build-noncuda-py312:
+    runs-on: ubuntu-22.04
+    container: pytorch/manylinux2_28-builder:cuda12.8
+    permissions:
+      contents: read
+    env:
+      BUILD_ARCHITECTURE: x86_64
+      BUILD_VARIANT: non-cuda
+      SOURCE_SHA: ce523b94f515a6d427c3e7953d160f48d366df91
+      VERSION: 0.3.13+diag20261025
+    steps:
+      - name: Checkout pinned source
+        uses: actions/checkout@v4
+        with:
+          ref: ce523b94f515a6d427c3e7953d160f48d366df91
+
+      - name: Verify pinned revision
+        run: |
+          git config --global --add safe.directory '*'
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Configure build profile
+        shell: bash
+        run: |
+          {
+            echo "VARIANT_FLAG=NON_CUDA_BUILD"
+            echo "CMAKE_GEN="
+            echo "TORCH_CUDA_ARCH_LIST="
+            echo "BUILD_NVLINK_ALLOCATOR=false"
+            echo "CMAKE_ARGS=-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DWITH_STORE_RUST=OFF -DCMAKE_BUILD_TYPE=Release"
+          } >> "$GITHUB_ENV"
+
+      - name: Patch wheel version in pyproject.toml
+        run: |
+          sed -i "s/^version = .*/version = \"$VERSION\"/" mooncake-wheel/pyproject.toml
+          grep -q "^version = \"$VERSION\"" mooncake-wheel/pyproject.toml
+
+      - name: Select Python 3.12 from manylinux image
+        run: |
+          PYBIN="/opt/python/cp312-cp312/bin"
+          echo "$PYBIN" >> "$GITHUB_PATH"
+          "$PYBIN/pip" install --quiet "cmake<4" setuptools wheel
+
+      - name: Configure project
+        run: |
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+          if [ -n "$SUDO" ] && command -v apt-get >/dev/null 2>&1; then
+            $SUDO apt-get update -y || true
+          fi
+          $SUDO bash -x dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          gen=(); [ -n "$CMAKE_GEN" ] && gen=(-G "$CMAKE_GEN")
+          mkdir -p build && cd build
+          # shellcheck disable=SC2086
+          cmake "${gen[@]}" .. $CMAKE_ARGS -DPython3_EXECUTABLE="$(which python3)"
+
+      - name: Build project
+        env:
+          MAX_JOBS: "2"
+        run: |
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -E"
+          cd build
+          cmake --build . -j"$(nproc)"
+          $SUDO cmake --install .
+
+      - name: Build Python wheel
+        run: |
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
+          variant=()
+          [ -n "$VARIANT_FLAG" ] && variant=("$VARIANT_FLAG=1")
+          env "${variant[@]}" \
+            PYTHON_VERSION=3.12 \
+            OUTPUT_DIR="dist-py312" \
+            ./scripts/build_wheel.sh
+        env:
+          VERSION: ${{ env.VERSION }}
+
+      - name: Verify wheel content
+        shell: bash
+        run: |
+          WHL=$(ls mooncake-wheel/dist-py312/*.whl)
+          echo "wheel: $WHL"
+          unzip -o -q "$WHL" -d /tmp/wheel-check
+          MASTER_BIN=$(find /tmp/wheel-check -name 'mooncake_master' | head -1)
+          test -n "$MASTER_BIN"
+          if ! grep -qa "ClearStaleHandlesInShard" "$MASTER_BIN"; then
+            echo "::error::remount-fix marker missing from mooncake_master"
+            exit 1
+          fi
+          if ! grep -rqa "MOONCAKE_DIAG_OVERFLOW_POLICY" /tmp/wheel-check; then
+            echo "::error::diagnostic marker missing from the wheel (master binary)"
+            exit 1
+          fi
+          grep -q "Version: $VERSION" /tmp/wheel-check/*.dist-info/METADATA
+
+      - name: Smoke test wheel
+        shell: bash
+        run: |
+          smoke_venv=$(mktemp -d)
+          python -m venv "$smoke_venv"
+          "$smoke_venv/bin/python" -m pip install --no-deps \
+            mooncake-wheel/dist-py312/*.whl
+          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          "$smoke_venv/bin/mooncake_master" --version
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-l3-cache-diag-noncuda-py312
+          path: mooncake-wheel/dist-py312/*.whl
